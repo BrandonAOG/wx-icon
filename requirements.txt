@@ -1,0 +1,11 @@
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+cartopy>=0.22
+xarray>=2024.1
+eccodes>=2.38
+requests>=2.31
+pyshp>=2.3
+boto3>=1.34
+pillow>=10
+ecmwf-opendata>=0.3
