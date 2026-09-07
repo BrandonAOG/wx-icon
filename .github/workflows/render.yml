@@ -1,0 +1,146 @@
+name: Render ICON maps and deploy
+
+on:
+  schedule:
+    # Poll every 30 min; ICON runs land ~4 h after cycle time.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-render even if this run is already live"
+        type: boolean
+        default: false
+      run:
+        description: "Specific run YYYYMMDDHH (blank = latest available)"
+        required: false
+      hours:
+        description: "Forecast hours, e.g. 0-120/6 (blank = model's full range)"
+        required: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One render at a time; a poll that fires mid-render waits, then sees the run is live and exits.
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+env:
+  WX_MODEL: icon
+  SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      needs_render: ${{ steps.check.outputs.needs_render }}
+      chunks: ${{ steps.check.outputs.chunks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q requests numpy ecmwf-opendata
+      - id: check
+        env:
+          RUN: ${{ github.event.inputs.run }}
+          HOURS: ${{ github.event.inputs.hours }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          ARGS="--chunks 20"
+          if [ -n "$RUN" ]; then ARGS="$ARGS --run $RUN"; fi
+          if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
+          if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
+          python render/check.py $ARGS
+
+  render:
+    needs: check
+    if: needs.check.outputs.needs_render == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.check.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: System libraries (eccodes for GRIB, GEOS/PROJ for cartopy)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-dev libgeos-dev libproj-dev cdo
+      - run: pip install -r requirements.txt
+      - name: Cache Natural Earth shapefiles
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cartopy
+          key: natural-earth-50m-v1
+      - name: Cache ICON regrid weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/icon_weights
+          key: icon-weights-0125-v1
+      - name: Render hours ${{ matrix.chunk }}
+        run: python render/render.py --run ${{ needs.check.outputs.run }} --hours "${{ matrix.chunk }}" --workers 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ strategy.job-index }}
+          path: site/images
+          retention-days: 1
+          if-no-files-found: error
+
+  assemble:
+    needs: [check, render]
+    if: needs.check.outputs.needs_render == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: System libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-dev libgeos-dev libproj-dev cdo
+      - run: pip install -r requirements.txt
+      - name: Cache Natural Earth shapefiles
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cartopy
+          key: natural-earth-50m-v1
+      - name: Collect rendered slices
+        uses: actions/download-artifact@v4
+        with:
+          pattern: images-*
+          path: site/images
+          merge-multiple: true
+      - name: Write manifest
+        env:
+          HOURS: ${{ github.event.inputs.hours }}
+        run: |
+          ARGS="--manifest-only --run ${{ needs.check.outputs.run }}"
+          if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
+          python render/render.py $ARGS
+          find site/images -name '*.png' | wc -l
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: assemble
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
