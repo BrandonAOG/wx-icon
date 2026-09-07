@@ -25,6 +25,8 @@ from config import (MODEL, NOMADS_DIR, NOMADS_FILE, NOMADS_FILTER, NOMADS_IDX,
 ECMWF_FILE = "https://data.ecmwf.int/forecasts/{ymd}/{hh}z/ifs/0p25/oper/{ymd}{hh}0000-{step}h-oper-fc.grib2"
 
 log = logging.getLogger("fetch")
+logging.getLogger("multiurl").setLevel(logging.WARNING)      # ECMWF client: no per-file progress bars
+logging.getLogger("ecmwf.opendata").setLevel(logging.ERROR)
 
 # cfgrib short names for each (VAR, LEVEL) pair we ask NOMADS for.
 CFGRIB_NAMES = {
@@ -87,6 +89,8 @@ def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
         return None            # handled in run_max_hour via cmc_step_complete
     if src == "icon":
         return icon_urls(run, step, {("msl", None)})[0]
+    if src == "gefs":
+        return GEFS_IDX.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), mem=MODEL["members"][-1], fhr=step)
     return None
 
 
@@ -115,9 +119,11 @@ def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> i
 
 
 def all_fetch_pairs(param_ids: list[str]) -> set[tuple[str, str]]:
+    from config import products
+    table = products()
     pairs: set[tuple[str, str]] = set()
     for pid in param_ids:
-        pairs.update(PARAMS[pid]["fetch"])
+        pairs.update(table[pid]["fetch"])
     return pairs
 
 
@@ -143,8 +149,9 @@ def prev_steps(param_ids: list[str]) -> dict:
     """{offset: {"fetch": set(pairs), "ecmwf": set(pairs)}} merged across products.
     offset is an int (hours back) or "f0"."""
     out: dict = {}
+    from config import products
     for pid in param_ids:
-        spec = PARAMS[pid].get("prev")
+        spec = products()[pid].get("prev")
         if not spec:
             continue
         for off in spec["offsets"]:
@@ -285,6 +292,24 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
     return dest
 
 
+# ------------------------------------------------------------- GEFS ---------
+GEFS_FILTER = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gefs_atmos_0p50a.pl"
+GEFS_DIR = "/gefs.{ymd}/{hh}/atmos/pgrb2ap5"
+GEFS_FILE = "ge{mem}.t{hh}z.pgrb2a.0p50.f{fhr:03d}"
+GEFS_IDX = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.{ymd}/{hh}/atmos/pgrb2ap5/ge{mem}.t{hh}z.pgrb2a.0p50.f{fhr:03d}.idx"
+
+
+def gefs_member_url(run: dt.datetime, fhr: int, member: str, pairs, bbox) -> str:
+    lon0, lon1, lat0, lat1 = bbox
+    q = {"dir": GEFS_DIR.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H")),
+         "file": GEFS_FILE.format(mem=member, hh=run.strftime("%H"), fhr=fhr),
+         "subregion": "", "leftlon": f"{lon0 % 360:g}", "rightlon": f"{lon1 % 360:g}",
+         "toplat": f"{lat1:g}", "bottomlat": f"{lat0:g}"}
+    for var, lev in pairs:
+        q[f"var_{var}"] = "on"; q[f"lev_{lev}"] = "on"
+    return GEFS_FILTER + "?" + urlencode(q, safe="\\()")
+
+
 # ------------------------------------------------------------- CMC GDPS -----
 # MSC Datamart (2025+ layout): one GRIB2 per field per step, global 0.15° lat-lon.
 #   https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr}/
@@ -303,15 +328,15 @@ CMC_PATTERNS = {
     "v":    [r"WindV_IsbL-{lev}", r"VGRD_IsbL-{lev}", r"WindComponentV_IsbL-{lev}", r"VWind_IsbL-{lev}"],
     "r":    [r"RelativeHumidity_IsbL-{lev}", r"RelHum_IsbL-{lev}", r"RH_IsbL-{lev}"],
     "vo":   [r"AbsoluteVorticity_IsbL-{lev}", r"ABSV_IsbL-{lev}"],
-    "msl":  [r"PressureMSL_MSL-0", r"PressureReducedToMSL_MSL-0", r"MSLP_MSL-0", r"PRMSL_MSL-0", r"Pressure.*MSL"],
-    "tp":   [r"PrecipAccum_Sfc-0", r"TotalPrecip.*_Sfc-0", r"PrecipTotal.*_Sfc-0", r"APCP_Sfc-0", r"Precip.*Accum[^_]*_Sfc-0"],
-    "2t":   [r"AirTemp_AGL-2m", r"TMP_AGL-2m"],
-    "10u":  [r"WindU_AGL-10m", r"UGRD_AGL-10m", r"WindComponentU_AGL-10m"],
-    "10v":  [r"WindV_AGL-10m", r"VGRD_AGL-10m", r"WindComponentV_AGL-10m"],
-    "cape": [r"CAPE_Sfc-0", r"ConvectiveAvailablePotentialEnergy_Sfc-0"],
-    "snod": [r"SnowDepth_Sfc-0", r"SNOD_Sfc-0"],
-    "skt":  [r"SurfaceTemp_Sfc-0", r"SkinTemp_Sfc-0", r"AirTemp_Sfc-0", r"TMP_Sfc-0"],
-    "lsm":  [r"LandCover_Sfc-0", r"LandMask_Sfc-0", r"LandSeaMask_Sfc-0", r"LAND_Sfc-0", r"Land.*_Sfc-0"],
+    "msl":  [r"Pressure_MSL", r"PressureMSL_MSL(-0)?", r"Pressure.*MSL.*"],
+    "tp":   [r"Precip-Accum_Sfc", r"PrecipAccum_Sfc(-0)?", r"Precip.*Accum_Sfc(-0)?"],
+    "2t":   [r"AirTemp_AGL-2m"],
+    "10u":  [r"WindU_AGL-10m"],
+    "10v":  [r"WindV_AGL-10m"],
+    "cape": [r"CAPE_Sfc(-0)?"],
+    "snod": [r"SnowDepth_Sfc(-0)?", r"Snow-?Depth_Sfc(-0)?"],
+    "skt":  [r"RadiativeTemp_Sfc(-0)?", r"SurfaceTemp_Sfc(-0)?", r"SkinTemp_Sfc(-0)?", r"AirTemp_Sfc(-0)?"],
+    "lsm":  [r"LandWaterProportion_Sfc(-0)?", r"LandCover_Sfc(-0)?", r"LandMask_Sfc(-0)?", r"Land.*_Sfc(-0)?"],
 }
 _CMC_TOKENS: dict | None = None
 
@@ -337,9 +362,9 @@ def _listing(session, url, retries: int = 4):
 CMC_DEFAULT_TOKENS = {
     "gh": "GeopotentialHeight_IsbL-{lev:04d}", "t": "AirTemp_IsbL-{lev:04d}", "u": "WindU_IsbL-{lev:04d}",
     "v": "WindV_IsbL-{lev:04d}", "r": "RelativeHumidity_IsbL-{lev:04d}", "vo": "AbsoluteVorticity_IsbL-{lev:04d}",
-    "msl": "PressureMSL_MSL-0", "tp": "PrecipAccum_Sfc-0", "2t": "AirTemp_AGL-2m", "10u": "WindU_AGL-10m",
-    "10v": "WindV_AGL-10m", "cape": "CAPE_Sfc-0", "snod": "SnowDepth_Sfc-0", "skt": "SurfaceTemp_Sfc-0",
-    "lsm": "LandCover_Sfc-0",
+    "msl": "Pressure_MSL", "tp": "Precip-Accum_Sfc", "2t": "AirTemp_AGL-2m", "10u": "WindU_AGL-10m",
+    "10v": "WindV_AGL-10m", "cape": "CAPE_Sfc", "snod": "SnowDepth_Sfc", "skt": "RadiativeTemp_Sfc",
+    "lsm": "LandWaterProportion_Sfc",
 }
 
 

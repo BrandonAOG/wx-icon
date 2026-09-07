@@ -32,12 +32,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import requests  # noqa: E402
 
 import plots  # noqa: E402
 import storage  # noqa: E402
-from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, PARAMS, REGIONS, model_params, param_hours)  # noqa: E402
-from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_files, download_grouped, ecmwf_pairs,
+from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, REGIONS, model_params, param_hours, products)  # noqa: E402
+PARAMS = products()  # deterministic or ensemble product table for this model
+ENSEMBLE = MODEL.get("kind") == "ensemble"
+if ENSEMBLE:
+    import ensemble  # noqa: E402
+from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_files, download_grouped, ecmwf_pairs, gefs_member_url,
                    latest_available_run, load_grib, merge, normalise, prev_steps, step_for,
                    synthetic_fields)  # noqa: E402
 
@@ -68,6 +73,8 @@ def render_frame(run_iso: str, fhr: int, region: str, param_ids: list[str],
     grib_paths: {"": main file, "_m24": file for fhr-24, "_f0": file for hour 0, ...}"""
     run = dt.datetime.fromisoformat(run_iso)
     bbox = REGIONS[region]["bbox"]
+    if ENSEMBLE:
+        return render_ensemble_frame(run, fhr, region, param_ids, grib_paths, out_dir, synthetic)
     if synthetic:
         fields = synthetic_fields(fhr, padded(bbox))
     else:
@@ -112,6 +119,51 @@ def compress_png(path: Path):
         im.save(path, optimize=True)
     except Exception as e:  # noqa: BLE001
         log.warning("compress failed for %s: %s", path.name, e)
+
+
+def render_ensemble_frame(run, fhr, region, param_ids, grib_paths, out_dir, synthetic):
+    """Load every member for this hour, stack, crop to the region, draw ensemble products."""
+    from ensemble import Stack
+    bbox = REGIONS[region]["bbox"]
+    members, fields = [], []
+    if synthetic:
+        rng = np.random.default_rng(fhr)
+        for i, m in enumerate(MODEL["members"]):
+            f = synthetic_fields(fhr, padded(bbox), tags=("",))
+            for k in ("prmsl", "gh500", "t850", "t2m", "u10", "v10", "tp_6"):
+                f[k] = f[k] * (1 + 0.004 * rng.normal() * (1 + fhr / 48)) + (rng.normal() * (150 if k == "prmsl" else 0.4) * (1 + fhr / 48))
+            members.append(m); fields.append(f)
+    else:
+        for m, path in (grib_paths or {}).items():
+            try:
+                f = normalise(crop(load_grib(Path(path)), padded(bbox)), fhr)
+                members.append(m); fields.append(f)
+            except Exception as e:  # noqa: BLE001
+                log.warning("f%03d member %s unreadable: %s", fhr, m, e)
+    if len(fields) < 3:
+        log.error("f%03d %s: only %d members loaded, skipping", fhr, region, len(fields))
+        return []
+    keys = set.intersection(*(set(f) for f in fields))
+    stack = Stack({k: np.stack([f[k] for f in fields]) for k in keys})
+    stack.lon, stack.lat, stack.members = fields[0].lon, fields[0].lat, members
+    if fhr == 0 and region == list(REGIONS)[0]:
+        log.info("ensemble fields at f000 (%d members): %s", len(members), " ".join(sorted(keys)))
+    meta = {"run": run, "fhr": fhr, "bbox": bbox, "region": region, "region_name": REGIONS[region]["name"], "members": members}
+    written = []
+    for pid in param_ids:
+        if fhr not in param_hours(pid):
+            continue
+        fn = getattr(ensemble, PARAMS[pid]["plot"])
+        dest = Path(out_dir) / region / pid / f"f{fhr:03d}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fig = fn(stack, meta)
+            fig.savefig(dest, dpi=fig.dpi, facecolor="white"); plt.close(fig)
+            compress_png(dest); written.append(str(dest))
+        except Exception as e:  # noqa: BLE001
+            plt.close("all")
+            log.error("failed %s %s f%03d: %s", region, pid, fhr, str(e)[:160])
+    return written
 
 
 def write_manifest(run_id: str, hours: list[int], regions: list[str], param_ids: list[str]):
@@ -201,7 +253,7 @@ def main():
         return
 
     grib_dir = Path(tempfile.mkdtemp(prefix="wx_grib_")) if not args.keep_grib else ROOT / "grib" / run_id
-    pairs = all_fetch_pairs(args.params)
+    pairs = all_fetch_pairs(args.params) if (MODEL["source"] == "nomads" or ENSEMBLE) else set()
 
     # 1. download (sequential; both servers rate-limit aggressive parallel clients)
     #    GFS: one regional subset per (hour, region) plus small previous-step subsets.
@@ -213,6 +265,24 @@ def main():
         if args.synthetic:
             for region in args.regions:
                 grib_paths[(fhr, region)] = None
+            continue
+        if ENSEMBLE:
+            bbox = MODEL["domain"]
+            files = {}
+            def one(m):
+                dest = grib_dir / f"{m}_f{fhr:03d}.grb2"
+                try:
+                    download(gefs_member_url(run, fhr, m, pairs, bbox), dest, session, retries=5)
+                    return m, str(dest)
+                except RuntimeError as e:
+                    log.warning("f%03d member %s: %s", fhr, m, e); return m, None
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=4) as pool:
+                for m, path in pool.map(one, MODEL["members"]):
+                    if path:
+                        files[m] = path
+            for region in args.regions:
+                grib_paths[(fhr, region)] = files
             continue
         if MODEL["source"] != "nomads":
             fetch = download_ecmwf if MODEL["source"] == "ecmwf_opendata" else \
@@ -281,6 +351,17 @@ def main():
                 grib_paths[(fhr, region)] = {"": str(dest)}
             except RuntimeError as e:
                 log.error("still failing: %s", e)
+
+    # 1c. warm the basemap cache once here, so worker processes don't race to
+    #     download the same Natural Earth zips and corrupt each other's copies
+    layers = plots._basemap_layers()
+    if len(layers) < 3:
+        log.warning("only %d/3 basemap layers loaded; retrying once", len(layers))
+        plots._BASEMAP = None
+        import shutil as _sh
+        _sh.rmtree(Path.home() / ".local/share/cartopy", ignore_errors=True)
+        layers = plots._basemap_layers()
+    log.info("basemap layers ready: %d/3", len(layers))
 
     # 2. render in parallel
     jobs = [(fhr, region, p) for (fhr, region), p in grib_paths.items()]

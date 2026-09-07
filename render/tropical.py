@@ -461,6 +461,8 @@ def main():
                 cone_bytes = b""
             decks[s["id"]] = (a_text, b_text, cone_bytes)
 
+    from plots import _basemap_layers
+    _basemap_layers()
     result = {"generated": dt.datetime.now(dt.timezone.utc).isoformat(), "storms": [], "overviews": {}}
     for s in storms:
         a_text, b_text, cone_bytes = decks[s["id"]]

@@ -53,6 +53,17 @@ MODELS["icon"] = {
     "params": None, "credit": "Deutscher Wetterdienst ICON (open data, CC-BY-4.0)",
 }
 
+# ---------------------------------------------------------------- ensembles --
+MODELS["gefs"] = {
+    "id": "gefs", "name": "GEFS", "resolution": "0.5°", "source": "gefs", "kind": "ensemble",
+    "cycles": [0, 6, 12, 18], "min_age_hours": 5.5,
+    "hours": list(range(0, 241, 6)),
+    "members": ["c00"] + [f"p{i:02d}" for i in range(1, 31)],
+    # one regional subset per member per hour covering every region we render
+    "domain": (-150, -10, 0, 66),
+    "params": None, "credit": "NOAA/NCEP GEFS via NOMADS",
+}
+
 MODEL = MODELS[os.environ.get("WX_MODEL", "gfs").lower()]
 FORECAST_HOURS = MODEL["hours"]
 
@@ -81,11 +92,18 @@ def model_params() -> list:
     """Product ids this model can render."""
     if MODEL["params"]:
         return list(MODEL["params"])
+    if MODEL.get("kind") == "ensemble":
+        return list(ENS_PARAMS)
     return [pid for pid in PARAMS if supported(pid)]
 
 
+def products() -> dict:
+    """The product table for this model (deterministic or ensemble)."""
+    return ENS_PARAMS if MODEL.get("kind") == "ensemble" else PARAMS
+
+
 def param_hours(pid: str) -> list:
-    mh = PARAMS[pid].get("max_hour")
+    mh = products()[pid].get("max_hour")
     return [h for h in FORECAST_HOURS if mh is None or h <= mh]
 
 # How many runs to keep. Only meaningful when images persist between jobs
@@ -287,6 +305,29 @@ PARAMS = {
         "fetch": [("HGT", "850_mb"), ("UGRD", "850_mb"), ("VGRD", "850_mb")],
         "spec": [("gh", 850), ("u", 850), ("v", 850)]
     },
+}
+
+# ----------------------------------------------------- ensemble products -----
+# Computed from the member stack. `fetch` = NOMADS grib_filter pairs fetched for
+# EVERY member; all products share one download per member per hour.
+_ENS_FETCH = [("HGT", "500_mb"), ("PRMSL", "mean_sea_level"), ("TMP", "850_mb"), ("TMP", "2_m_above_ground"),
+              ("UGRD", "10_m_above_ground"), ("VGRD", "10_m_above_ground"), ("APCP", "surface")]
+ENS_PARAMS = {
+    "ens_mslp":      {"name": "MSLP mean & spread",           "group": "Mean & spread", "plot": "ens_mslp",      "fetch": _ENS_FETCH},
+    "ens_z500":      {"name": "500 mb height mean & spread",  "group": "Mean & spread", "plot": "ens_z500",      "fetch": _ENS_FETCH},
+    "ens_t850":      {"name": "850 mb temp mean & spread",    "group": "Mean & spread", "plot": "ens_t850",      "fetch": _ENS_FETCH},
+    "ens_t2m":       {"name": "2 m temp mean & spread",       "group": "Mean & spread", "plot": "ens_t2m",       "fetch": _ENS_FETCH},
+    "ens_precip6":   {"name": "6-hr precip mean",             "group": "Mean & spread", "plot": "ens_precip6",   "fetch": _ENS_FETCH},
+    "ens_lows":      {"name": "Member low centres",           "group": "Mean & spread", "plot": "ens_lows",      "fetch": _ENS_FETCH},
+    "spag_z500":     {"name": "500 mb spaghetti (564, 582 dam)", "group": "Spaghetti",  "plot": "spag_z500",     "fetch": _ENS_FETCH},
+    "spag_mslp":     {"name": "MSLP spaghetti (1000, 1012 mb)", "group": "Spaghetti",   "plot": "spag_mslp",     "fetch": _ENS_FETCH},
+    "prob_wind34":   {"name": "Prob. 10 m wind ≥ 34 kt",      "group": "Probability",   "plot": "prob_wind34",   "fetch": _ENS_FETCH},
+    "prob_wind50":   {"name": "Prob. 10 m wind ≥ 50 kt",      "group": "Probability",   "plot": "prob_wind50",   "fetch": _ENS_FETCH},
+    "prob_wind64":   {"name": "Prob. 10 m wind ≥ 64 kt",      "group": "Probability",   "plot": "prob_wind64",   "fetch": _ENS_FETCH},
+    "prob_precip05": {"name": "Prob. 6-hr precip ≥ 0.5 in",   "group": "Probability",   "plot": "prob_precip05", "fetch": _ENS_FETCH},
+    "prob_precip1":  {"name": "Prob. 6-hr precip ≥ 1 in",     "group": "Probability",   "plot": "prob_precip1",  "fetch": _ENS_FETCH},
+    "prob_mslp1000": {"name": "Prob. MSLP ≤ 1000 mb",         "group": "Probability",   "plot": "prob_mslp1000", "fetch": _ENS_FETCH},
+    "prob_t850frz":  {"name": "Prob. 850 mb temp ≤ 0 °C",     "group": "Probability",   "plot": "prob_t850frz",  "fetch": _ENS_FETCH},
 }
 
 # Output image size (inches × dpi)
