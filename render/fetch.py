@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -77,13 +78,13 @@ def latest_available_run(now: dt.datetime | None = None,
     raise RuntimeError("No GFS run found on NOMADS in the last 48 h")
 
 
-def _probe_url(run: dt.datetime, step: int) -> str | None:
+def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
     """A file whose presence means `step` of this run is published."""
     src = MODEL["source"]
     if src == "ecmwf_opendata":
         return ECMWF_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step)
     if src == "cmc":
-        return cmc_urls(run, step, {("msl", None)})[0]
+        return None            # handled in run_max_hour via cmc_step_complete
     if src == "icon":
         return icon_urls(run, step, {("msl", None)})[0]
     return None
@@ -96,12 +97,20 @@ def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> i
         return MODEL["hours"][-1]
     session = session or requests.Session()
     for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
-        url = _probe_url(run, last)
-        try:
-            if session.head(url, timeout=30, allow_redirects=True).status_code == 200:
+        if MODEL["source"] == "cmc":
+            # also require the last 6-hourly step before the end, so a run whose
+            # tail happens to be up first isn't mistaken for complete
+            if cmc_step_complete(run, last, session) and cmc_step_complete(run, last - 6, session):
                 return last
+            continue
+        url = _probe_url(run, last, session)
+        try:
+            r = session.get(url, timeout=30, allow_redirects=True, stream=True); r.close()
+            if r.status_code == 200:
+                return last
+            log.info("probe %s -> HTTP %s", url.rsplit("/", 1)[-1], r.status_code)
         except requests.RequestException as e:
-            log.warning("HEAD %s failed: %s", url, e)
+            log.warning("probe %s failed: %s", url, e)
     return None
 
 
@@ -277,28 +286,127 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
 
 
 # ------------------------------------------------------------- CMC GDPS -----
-# One GRIB2 per field per step on the MSC Datamart, global 0.15° lat-lon.
-CMC_URL = ("https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gem_global/15km/grib2/lat_lon/{hh}/{fhr:03d}/"
-           "CMC_glb_{var}_latlon.15x.15_{ymd}{hh}_P{fhr:03d}.grib2")
-CMC_NAMES = {   # generic (field, level) -> Datamart VAR_LEVELTYPE_LEVEL
-    "gh": "HGT_ISBL_{lev}", "t": "TMP_ISBL_{lev}", "u": "UGRD_ISBL_{lev}", "v": "VGRD_ISBL_{lev}",
-    "r": "RH_ISBL_{lev}", "vo": "ABSV_ISBL_{lev}",
-    "msl": "PRMSL_MSL_0", "tp": "APCP_SFC_0", "2t": "TMP_TGL_2", "10u": "UGRD_TGL_10", "10v": "VGRD_TGL_10",
-    "cape": "CAPE_SFC_0", "snod": "SNOD_SFC_0", "skt": "TMP_SFC_0", "lsm": "LAND_SFC_0",
+# MSC Datamart (2025+ layout): one GRIB2 per field per step, global 0.15° lat-lon.
+#   https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr}/
+#   {ymd}T{hh}Z_MSC_GDPS_{Variable}_{LevelType}-{Level}_LatLon0.15_PT{fhr}H.grib2
+# Variable names are descriptive (AirTemp, AbsoluteVorticity, ...). We resolve
+# each generic field against the directory listing so renames don't break us.
+CMC_DIR = "https://dd.weather.gc.ca/{ymd}/WXO-DD/model_gdps/15km/{hh}/{fhr:03d}/"
+CMC_FILE = "{ymd}T{hh}Z_MSC_GDPS_{token}_LatLon0.15_PT{fhr:03d}H.grib2"
+
+# generic field -> regex candidates for the "{Variable}_{LevelType}-{Level}" token.
+# {lev} is the 4-digit isobaric level.
+CMC_PATTERNS = {
+    "gh":   [r"GeopotentialHeight_IsbL-{lev}", r"Geopotential.*_IsbL-{lev}", r"HGT_IsbL-{lev}"],
+    "t":    [r"AirTemp_IsbL-{lev}", r"TMP_IsbL-{lev}"],
+    "u":    [r"WindU_IsbL-{lev}", r"UGRD_IsbL-{lev}", r"WindComponentU_IsbL-{lev}", r"UWind_IsbL-{lev}"],
+    "v":    [r"WindV_IsbL-{lev}", r"VGRD_IsbL-{lev}", r"WindComponentV_IsbL-{lev}", r"VWind_IsbL-{lev}"],
+    "r":    [r"RelativeHumidity_IsbL-{lev}", r"RelHum_IsbL-{lev}", r"RH_IsbL-{lev}"],
+    "vo":   [r"AbsoluteVorticity_IsbL-{lev}", r"ABSV_IsbL-{lev}"],
+    "msl":  [r"PressureMSL_MSL-0", r"PressureReducedToMSL_MSL-0", r"MSLP_MSL-0", r"PRMSL_MSL-0", r"Pressure.*MSL"],
+    "tp":   [r"PrecipAccum_Sfc-0", r"TotalPrecip.*_Sfc-0", r"PrecipTotal.*_Sfc-0", r"APCP_Sfc-0", r"Precip.*Accum[^_]*_Sfc-0"],
+    "2t":   [r"AirTemp_AGL-2m", r"TMP_AGL-2m"],
+    "10u":  [r"WindU_AGL-10m", r"UGRD_AGL-10m", r"WindComponentU_AGL-10m"],
+    "10v":  [r"WindV_AGL-10m", r"VGRD_AGL-10m", r"WindComponentV_AGL-10m"],
+    "cape": [r"CAPE_Sfc-0", r"ConvectiveAvailablePotentialEnergy_Sfc-0"],
+    "snod": [r"SnowDepth_Sfc-0", r"SNOD_Sfc-0"],
+    "skt":  [r"SurfaceTemp_Sfc-0", r"SkinTemp_Sfc-0", r"AirTemp_Sfc-0", r"TMP_Sfc-0"],
+    "lsm":  [r"LandCover_Sfc-0", r"LandMask_Sfc-0", r"LandSeaMask_Sfc-0", r"LAND_Sfc-0", r"Land.*_Sfc-0"],
+}
+_CMC_TOKENS: dict | None = None
+
+
+def _listing(session, url, retries: int = 4):
+    """href targets from an Apache-style directory index. The Datamart gets
+    slow when many jobs hit it at once, so retry with backoff."""
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=90)
+            if r.status_code == 200:
+                return [h for h in re.findall(r'href="([^"?][^"]*)"', r.text) if not h.startswith("/")]
+            if r.status_code == 404:
+                return []
+            log.info("listing %s -> HTTP %s", url, r.status_code)
+        except requests.RequestException as e:
+            log.info("listing %s failed (attempt %d): %s", url, attempt + 1, str(e)[:80])
+        time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+    return []
+
+
+# Confirmed against the live Datamart (Sep 2026); used when the listing is unreachable.
+CMC_DEFAULT_TOKENS = {
+    "gh": "GeopotentialHeight_IsbL-{lev:04d}", "t": "AirTemp_IsbL-{lev:04d}", "u": "WindU_IsbL-{lev:04d}",
+    "v": "WindV_IsbL-{lev:04d}", "r": "RelativeHumidity_IsbL-{lev:04d}", "vo": "AbsoluteVorticity_IsbL-{lev:04d}",
+    "msl": "PressureMSL_MSL-0", "tp": "PrecipAccum_Sfc-0", "2t": "AirTemp_AGL-2m", "10u": "WindU_AGL-10m",
+    "10v": "WindV_AGL-10m", "cape": "CAPE_Sfc-0", "snod": "SnowDepth_Sfc-0", "skt": "SurfaceTemp_Sfc-0",
+    "lsm": "LandCover_Sfc-0",
 }
 
 
-def cmc_urls(run: dt.datetime, step: int, pairs: set) -> list[str]:
+def cmc_tokens(run: dt.datetime, session: requests.Session | None = None) -> dict:
+    """Resolve generic fields to the Datamart's variable_level tokens by reading
+    the listing for step 0 (and step 6 for accumulated precip, absent at 0)."""
+    global _CMC_TOKENS
+    if _CMC_TOKENS is not None:
+        return _CMC_TOKENS
+    session = session or requests.Session()
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
+    names = set()
+    for step in (0, 6):
+        for f in _listing(session, CMC_DIR.format(ymd=ymd, hh=hh, fhr=step)):
+            m = re.match(r".*?_MSC_GDPS_(.+)_LatLon0\.15_PT\d{3}H\.grib2$", f)
+            if m:
+                names.add(m.group(1))
+    tokens: dict = {}
+    if not names:
+        log.warning("CMC: listing unavailable for %s %sZ; using known field names", ymd, hh)
+        _CMC_TOKENS = dict(CMC_DEFAULT_TOKENS)
+        return _CMC_TOKENS
+    for field, pats in CMC_PATTERNS.items():
+        # isobaric fields: find the family once using level 0500, then template the level
+        for pat in pats:
+            probe = pat.format(lev="0500") if "{lev}" in pat else pat
+            hit = next((n for n in sorted(names) if re.fullmatch(probe, n)), None)
+            if hit:
+                tokens[field] = hit.replace("0500", "{lev:04d}") if "{lev}" in pat else hit
+                break
+        if field not in tokens:
+            if field in CMC_DEFAULT_TOKENS:
+                tokens[field] = CMC_DEFAULT_TOKENS[field]
+                log.warning("CMC: no listing match for '%s'; using default %s", field, tokens[field])
+            else:
+                log.warning("CMC: no match for '%s' (tried %s)", field, pats[0])
+    log.info("CMC resolved %d/%d fields: %s", len(tokens), len(CMC_PATTERNS), tokens)
+    unmatched = sorted(n for n in names if not any(n == t or re.fullmatch(t.replace("{lev:04d}", r"\d{4}"), n) for t in tokens.values()))
+    log.info("CMC other variables present (%d): %s", len(unmatched), " ".join(unmatched[:80]))
+    _CMC_TOKENS = tokens
+    return tokens
+
+
+def cmc_urls(run: dt.datetime, step: int, pairs: set, session: requests.Session | None = None) -> list[str]:
+    tokens = cmc_tokens(run, session)
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
     urls = []
     for name, lev in pairs:
         if name == "tp" and step == 0:
             continue
-        tmpl = CMC_NAMES.get(name)
-        if not tmpl:
+        tok = tokens.get(name)
+        if not tok:
             continue
-        urls.append(CMC_URL.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step,
-                                   var=tmpl.format(lev=lev)))
+        token = tok.format(lev=int(lev)) if lev is not None else tok
+        urls.append(CMC_DIR.format(ymd=ymd, hh=hh, fhr=step) + CMC_FILE.format(ymd=ymd, hh=hh, token=token, fhr=step))
     return urls
+
+
+def cmc_step_complete(run: dt.datetime, step: int, session, min_files: int = 40) -> bool:
+    """The Datamart creates step folders before all files arrive, so 'folder
+    exists' isn't enough: require a populated listing including MSLP."""
+    files = [f for f in _listing(session, CMC_DIR.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), fhr=step))
+             if f.endswith(".grib2")]
+    ok = len(files) >= min_files and any("MSL" in f for f in files)
+    if not ok:
+        log.info("CMC step %03d: %d files present, not complete", step, len(files))
+    return ok
 
 
 # ------------------------------------------------------------- DWD ICON -----
@@ -372,7 +480,7 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
-    urls = cmc_urls(run, step, pairs) if MODEL["source"] == "cmc" else icon_urls(run, step, pairs)
+    urls = cmc_urls(run, step, pairs, session) if MODEL["source"] == "cmc" else icon_urls(run, step, pairs)
     if not urls:
         raise RuntimeError(f"nothing to fetch for step {step}")
     raw = dest.with_suffix(".raw.grib2")
@@ -497,18 +605,22 @@ def normalise(f: "Fields", fhr: int = 0) -> "Fields":
     src = MODEL["source"]
     accum_from_zero = src in ("ecmwf_opendata", "cmc", "icon")
     # ---- name aliases (any tag suffix)
-    alias = {"msl": "prmsl", "tcwv": "pwat", "tciwv": "pwat", "sde": "snod", "z": "gh"}
-    for k in list(f):
-        base, tag = (k.split("_m", 1)[0], "_m" + k.split("_m", 1)[1]) if "_m" in k and k.split("_m", 1)[1].isdigit() else \
-                    ((k[:-3], "_f0") if k.endswith("_f0") else (k, ""))
-        for old, new in alias.items():
-            if base == old or (base.startswith(old) and base[len(old):].isdigit()):
-                nk = new + base[len(old):] + tag
-                if nk not in f:
-                    f[nk] = f.pop(k)
-                    if old == "z":                                   # ICON geopotential m²/s² -> gpm
-                        f[nk] = f[nk] / 9.80665
-                break
+    alias = {"msl": "prmsl", "tcwv": "pwat", "tciwv": "pwat", "sde": "snod", "z": "gh",
+             # DWD local names that eccodes passes through verbatim
+             "TQV": "pwat", "T_G": "t_sfc", "CAPE_ML": "cape", "H_SNOW": "snod", "FR_LAND": "lsm", "PMSL": "prmsl",
+             "TOT_PREC": "tp", "T_2M": "t2m", "U_10M": "u10", "V_10M": "v10", "RELHUM": "r", "FI": "z"}
+    for _pass in range(2):                                        # two passes so FI -> z -> gh resolves
+        for k in list(f):
+            base, tag = (k.split("_m", 1)[0], "_m" + k.split("_m", 1)[1]) if "_m" in k and k.split("_m", 1)[1].isdigit() else \
+                        ((k[:-3], "_f0") if k.endswith("_f0") else (k, ""))
+            for old, new in alias.items():
+                if base == old or (base.startswith(old) and base[len(old):].isdigit()):
+                    nk = new + base[len(old):] + tag
+                    if nk not in f:
+                        f[nk] = f.pop(k)
+                        if old == "z":                               # ICON geopotential m²/s² -> gpm
+                            f[nk] = f[nk] / 9.80665
+                    break
     if "vo500" in f and "absv500" not in f:                      # relative -> absolute vorticity
         _, LAT = np.meshgrid(f.lon, f.lat)
         f["absv500"] = f["vo500"] + 2 * 7.2921e-5 * np.sin(np.radians(LAT))

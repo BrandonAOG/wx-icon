@@ -98,7 +98,8 @@ def render_frame(run_iso: str, fhr: int, region: str, param_ids: list[str],
             compress_png(dest)
             written.append(str(dest))
         except Exception as e:  # noqa: BLE001
-            log.exception("failed %s %s f%03d: %s", region, pid, fhr, e)
+            plt.close("all")
+            log.error("failed %s %s f%03d: %s", region, pid, fhr, str(e)[:160])
     return written
 
 
