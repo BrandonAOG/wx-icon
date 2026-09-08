@@ -37,12 +37,14 @@ import requests  # noqa: E402
 
 import plots  # noqa: E402
 import storage  # noqa: E402
-from config import (FORECAST_HOURS, KEEP_RUNS, MODEL, REGIONS, model_params, param_hours, products)  # noqa: E402
+from config import (FORECAST_HOURS, KEEP_RUNS, MANIFEST_NAME, MODEL, REGIONS, model_params, param_hours, products)  # noqa: E402
 PARAMS = products()  # deterministic or ensemble product table for this model
 ENSEMBLE = MODEL.get("kind") == "ensemble"
+_LOGGED_FIELDS: set = set()
 if ENSEMBLE:
     import ensemble  # noqa: E402
-from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_files, download_grouped, ecmwf_pairs, gefs_member_url,
+from fetch import Fields  # noqa: E402
+from fetch import (all_fetch_pairs, available_pairs, build_filter_url, crop, download, download_aigefs_member, download_ecmwf, download_ecmwf_ens, download_files, download_geps, download_grouped, ecmwf_pairs, gefs_member_url, load_grib_members, pack_members,
                    latest_available_run, load_grib, merge, normalise, prev_steps, step_for,
                    synthetic_fields)  # noqa: E402
 
@@ -78,17 +80,22 @@ def render_frame(run_iso: str, fhr: int, region: str, param_ids: list[str],
     if synthetic:
         fields = synthetic_fields(fhr, padded(bbox))
     else:
-        fields = load_grib(Path(grib_paths[""]))
+        win = padded(bbox) if MODEL["source"] == "nomads_grid" else None
+        try:
+            fields = load_grib(Path(grib_paths[""]), bbox=win)
+        except Exception as e:  # noqa: BLE001
+            log.error("f%03d %s: data unreadable: %s", fhr, region, str(e)[:200]); return []
         for tag, path in grib_paths.items():
             if tag and path:
                 try:
-                    fields = merge(fields, load_grib(Path(path), tag))
+                    fields = merge(fields, load_grib(Path(path), tag, bbox=win))
                 except Exception as e:  # noqa: BLE001
                     log.warning("f%03d %s: previous-step file %s unreadable: %s", fhr, region, tag, e)
         fields = crop(fields, padded(bbox))
     fields = normalise(fields, fhr)
-    if fhr == 0 and region == list(REGIONS)[0]:
-        log.info("fields available at f000: %s", " ".join(sorted(fields)))
+    if region == list(REGIONS)[0] and not _LOGGED_FIELDS:
+        _LOGGED_FIELDS.add(1)
+        log.info("fields available at f%03d: %s", fhr, " ".join(sorted(fields)))
     meta = {"run": run, "fhr": fhr, "bbox": bbox, "region": region,
             "region_name": REGIONS[region]["name"]}
     written = []
@@ -133,6 +140,18 @@ def render_ensemble_frame(run, fhr, region, param_ids, grib_paths, out_dir, synt
             for k in ("prmsl", "gh500", "t850", "t2m", "u10", "v10", "tp_6"):
                 f[k] = f[k] * (1 + 0.004 * rng.normal() * (1 + fhr / 48)) + (rng.normal() * (150 if k == "prmsl" else 0.4) * (1 + fhr / 48))
             members.append(m); fields.append(f)
+    elif MODEL["source"] in ("ecmwf_ens", "ecmwf_aifs_ens", "geps"):
+        # packed .npz prepared once per hour in the main process (see pack_members)
+        try:
+            z = np.load(grib_paths["npz"], allow_pickle=False)
+            lon, lat = z["lon"], z["lat"]; mems = list(z["members"]); keys = list(z["keys"])
+            for i, m in enumerate(mems):
+                f = Fields(); f.lon, f.lat = lon, lat
+                for k in keys:
+                    f[k] = z[k][i]
+                members.append(m); fields.append(normalise(crop(f, padded(bbox)), fhr))
+        except Exception as e:  # noqa: BLE001
+            log.error("f%03d: packed ENS data unreadable: %s", fhr, e); return []
     else:
         for m, path in (grib_paths or {}).items():
             try:
@@ -167,10 +186,10 @@ def render_ensemble_frame(run, fhr, region, param_ids, grib_paths, out_dir, synt
 
 
 def write_manifest(run_id: str, hours: list[int], regions: list[str], param_ids: list[str]):
-    man_path = SITE / "manifest.json"
+    man_path = SITE / MANIFEST_NAME
     manifest = None
     if storage.enabled():
-        manifest = storage.get_json("manifest.json")   # merge with what's already published
+        manifest = storage.get_json(MANIFEST_NAME)   # merge with what's already published
     if manifest is None and man_path.exists():
         try:
             manifest = json.loads(man_path.read_text())
@@ -216,9 +235,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", help="YYYYMMDDHH; default = latest available on NOMADS")
     ap.add_argument("--hours", default=None, help="e.g. 0-120/6 or 0,6,12")
-    ap.add_argument("--regions", nargs="*", default=list(REGIONS))
+    ap.add_argument("--regions", nargs="*", default=MODEL.get("regions", list(REGIONS)))
     ap.add_argument("--params", nargs="*", default=model_params())
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=MODEL.get("workers", 4))
     ap.add_argument("--synthetic", action="store_true", help="fake data, no network")
     ap.add_argument("--keep-grib", action="store_true")
     ap.add_argument("--manifest-only", action="store_true", help="write manifest for images already in site/")
@@ -247,13 +266,13 @@ def main():
         hours = [h for h in hours if h in have] or hours
         manifest = write_manifest(run_id, hours, args.regions, args.params)
         if storage.enabled():
-            storage.put_json(manifest, "manifest.json")
+            storage.put_json(manifest, MANIFEST_NAME)
         prune_runs([r["id"] for r in manifest["model"]["runs"]])
-        log.info("manifest written: %d hours", len(hours))
+        log.info("%s written: %d hours", MANIFEST_NAME, len(hours))
         return
 
     grib_dir = Path(tempfile.mkdtemp(prefix="wx_grib_")) if not args.keep_grib else ROOT / "grib" / run_id
-    pairs = all_fetch_pairs(args.params) if (MODEL["source"] == "nomads" or ENSEMBLE) else set()
+    pairs = all_fetch_pairs(args.params) if MODEL["source"] in ("nomads", "nomads_grid", "gefs") else set()
 
     # 1. download (sequential; both servers rate-limit aggressive parallel clients)
     #    GFS: one regional subset per (hour, region) plus small previous-step subsets.
@@ -266,13 +285,32 @@ def main():
             for region in args.regions:
                 grib_paths[(fhr, region)] = None
             continue
+        if ENSEMBLE and MODEL["source"] in ("ecmwf_ens", "ecmwf_aifs_ens", "geps"):
+            files = {}
+            dl = (lambda r, st, fl, d: download_geps(r, st, fl, d, session)) if MODEL["source"] == "geps" else download_ecmwf_ens
+            try:
+                main = dl(run, fhr, MODEL["ens_fields"], grib_dir / f"ens_f{fhr:03d}.grib2")
+                prev_f = dl(run, fhr - 6, [("tp", None)], grib_dir / f"ens_f{fhr-6:03d}_tp.grib2") if fhr >= 6 else None
+                npz = pack_members(main, prev_f, MODEL["domain"], grib_dir / f"ens_f{fhr:03d}.npz")
+                for pth in (main, prev_f):
+                    if pth:
+                        Path(pth).unlink(missing_ok=True)      # free disk: the .npz is all we need now
+                files["npz"] = str(npz)
+            except Exception as e:  # noqa: BLE001
+                log.error("f%03d: %s", fhr, e); continue
+            for region in args.regions:
+                grib_paths[(fhr, region)] = files
+            continue
         if ENSEMBLE:
             bbox = MODEL["domain"]
             files = {}
             def one(m):
                 dest = grib_dir / f"{m}_f{fhr:03d}.grb2"
                 try:
-                    download(gefs_member_url(run, fhr, m, pairs, bbox), dest, session, retries=5)
+                    if MODEL["source"] == "aigefs":
+                        download_aigefs_member(run, fhr, m, dest, session)
+                    else:
+                        download(gefs_member_url(run, fhr, m, pairs, bbox), dest, session, retries=5)
                     return m, str(dest)
                 except RuntimeError as e:
                     log.warning("f%03d member %s: %s", fhr, m, e); return m, None
@@ -284,7 +322,35 @@ def main():
             for region in args.regions:
                 grib_paths[(fhr, region)] = files
             continue
-        if MODEL["source"] != "nomads":
+        if MODEL["source"] == "nomads_grid":
+            files = {}
+            dest = grib_dir / f"grid_f{fhr:03d}.grb2"
+            try:
+                have = available_pairs(run, fhr, pairs, session)
+                if not have:
+                    raise RuntimeError(f"f{fhr:03d}: none of the requested fields are in this file")
+                download(build_filter_url(run, fhr, have, None), dest, session)
+                files[""] = str(dest)
+            except RuntimeError as e:
+                log.error("f%03d: %s", fhr, e); continue
+            for off, spec in prev.items():
+                step = step_for(fhr, off)
+                if step is None or not spec["fetch"]:
+                    continue
+                tag = "_f0" if off == "f0" else f"_m{off}"
+                pdest = grib_dir / f"grid_f{step:03d}{tag}.grb2"
+                try:
+                    phave = available_pairs(run, step, spec["fetch"], session)
+                    if not phave:
+                        continue
+                    download(build_filter_url(run, step, phave, None), pdest, session, retries=3)
+                    files[tag] = str(pdest)
+                except RuntimeError as e:
+                    log.warning("%s", e)
+            for region in args.regions:
+                grib_paths[(fhr, region)] = files
+            continue
+        if MODEL["source"] not in ("nomads",):
             fetch = download_ecmwf if MODEL["source"] == "ecmwf_opendata" else \
                     (lambda r, st, prs, d: download_files(r, st, prs, d, session))
             files = {}
@@ -370,7 +436,10 @@ def main():
         futs = [ex.submit(render_frame, run.isoformat(), fhr, region, args.params,
                           p, str(out_dir), args.synthetic) for fhr, region, p in jobs]
         for fut in as_completed(futs):
-            n_done += len(fut.result())
+            try:
+                n_done += len(fut.result())
+            except Exception as e:  # noqa: BLE001
+                log.error("frame failed: %s", str(e)[:200])
             if n_done % 25 == 0:
                 log.info("%d images written", n_done)
     log.info("done: %d images", n_done)
@@ -380,11 +449,11 @@ def main():
         storage.upload_dir(out_dir, f"images/{MODEL['id']}/{run_id}")
     manifest = write_manifest(run_id, hours, args.regions, args.params)
     if storage.enabled():
-        storage.put_json(manifest, "manifest.json")
+        storage.put_json(manifest, MANIFEST_NAME)
     prune_runs([r["id"] for r in manifest["model"]["runs"]])
     if storage.enabled():
         shutil.rmtree(out_dir, ignore_errors=True)   # don't ship images in the Pages artifact too
-        (SITE / "manifest.json").unlink(missing_ok=True)
+        (SITE / MANIFEST_NAME).unlink(missing_ok=True)
     if not args.keep_grib:
         shutil.rmtree(grib_dir, ignore_errors=True)
 

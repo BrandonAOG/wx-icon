@@ -62,33 +62,41 @@ INVEST_MAX_AGE_H = 30                                           # a-deck must ha
 # GEFS members (AP01..AP30) are handled separately.
 MODELS = {
     "OFCL": ("NHC official",      "#000000", 2.6),
-    "AVNO": ("GFS",               "#d62728", 1.8),
-    "EMXI": ("ECMWF",             "#1f4ed8", 1.8),
-    "ECMF": ("ECMWF",             "#1f4ed8", 1.8),
-    "UKX":  ("UKMET",             "#2ca02c", 1.6),
-    "UKM":  ("UKMET",             "#2ca02c", 1.6),
-    "CMC":  ("Canadian",          "#ff7f0e", 1.6),
-    "NVGM": ("NAVGEM",            "#8c564b", 1.4),
-    "ICON": ("ICON",              "#17becf", 1.4),
-    "HFSA": ("HAFS-A",            "#e377c2", 1.6),
-    "HFSB": ("HAFS-B",            "#bc5090", 1.6),
-    "HWRF": ("HWRF",              "#9467bd", 1.6),
-    "HMON": ("HMON",              "#7f3fbf", 1.4),
-    "CTCX": ("COAMPS-TC",         "#a05195", 1.4),
-    "AEMN": ("GEFS mean",         "#b22222", 1.4),
-    "EEMN": ("ECMWF ens mean",    "#0b2a8a", 1.4),
-    "UEMN": ("UKMET ens mean",    "#1b6b1b", 1.4),
-    "ECAI": ("ECMWF AIFS",        "#4fa3ff", 1.4),
-    "FNV3": ("Google FNV3",       "#00a86b", 1.6),
-    "GNCS": ("Google GenCast",    "#2e8b57", 1.4),
-    "TVCN": ("Consensus TVCN",    "#555555", 2.0),
+    # --- global models (parent code, then the 6-h "I" and 12-h "2" interpolated versions
+    #     that NHC times to the current cycle; same label so they dedupe)
+    "AVNO": ("GFS",               "#d62728", 1.8), "AVNI": ("GFS", "#d62728", 1.8), "AVN2": ("GFS", "#d62728", 1.8),
+    "ECMF": ("ECMWF",             "#1f4ed8", 1.8), "EMXI": ("ECMWF", "#1f4ed8", 1.8), "EMX2": ("ECMWF", "#1f4ed8", 1.8),
+    "UKX":  ("UKMET",             "#2ca02c", 1.6), "UKM":  ("UKMET", "#2ca02c", 1.6), "UKXI": ("UKMET", "#2ca02c", 1.6), "UKX2": ("UKMET", "#2ca02c", 1.6), "EGRI": ("UKMET", "#2ca02c", 1.6),
+    "CMC":  ("Canadian",          "#ff7f0e", 1.6), "CMCI": ("Canadian", "#ff7f0e", 1.6), "CMC2": ("Canadian", "#ff7f0e", 1.6),
+    "NVGM": ("NAVGEM",            "#8c564b", 1.4), "NVGI": ("NAVGEM", "#8c564b", 1.4), "NVG2": ("NAVGEM", "#8c564b", 1.4),
+    "ICON": ("ICON",              "#17becf", 1.4), "ICNI": ("ICON", "#17becf", 1.4),
+    # --- AI models
+    "GDMN": ("Google DeepMind",   "#00a86b", 1.8), "GDMI": ("Google DeepMind", "#00a86b", 1.8), "GDM2": ("Google DeepMind", "#00a86b", 1.8),
+    "FNV3": ("Google FNV3",       "#00a86b", 1.8), "GNCS": ("Google GenCast", "#2e8b57", 1.4),
+    "ECAI": ("ECMWF AIFS",        "#4fa3ff", 1.4), "EAII": ("ECMWF AIFS", "#4fa3ff", 1.4),
+    "NGX":  ("NCEP AI-GFS",       "#e8590c", 1.4), "NGX2": ("NCEP AI-GFS", "#e8590c", 1.4), "NGXI": ("NCEP AI-GFS", "#e8590c", 1.4),
+    # --- hurricane models
+    "HFSA": ("HAFS-A",            "#e377c2", 1.6), "HFAI": ("HAFS-A", "#e377c2", 1.6), "HFA2": ("HAFS-A", "#e377c2", 1.6),
+    "HFSB": ("HAFS-B",            "#bc5090", 1.6), "HFBI": ("HAFS-B", "#bc5090", 1.6), "HFB2": ("HAFS-B", "#bc5090", 1.6),
+    "HWRF": ("HWRF",              "#9467bd", 1.6), "HWFI": ("HWRF", "#9467bd", 1.6), "HWF2": ("HWRF", "#9467bd", 1.6),
+    "HMON": ("HMON",              "#7f3fbf", 1.4), "HMNI": ("HMON", "#7f3fbf", 1.4), "HMN2": ("HMON", "#7f3fbf", 1.4),
+    "CTCX": ("COAMPS-TC",         "#a05195", 1.4), "CTCI": ("COAMPS-TC", "#a05195", 1.4), "CTC2": ("COAMPS-TC", "#a05195", 1.4),
+    # --- ensemble means
+    "AEMN": ("GEFS mean",         "#b22222", 1.4), "AEMI": ("GEFS mean", "#b22222", 1.4), "AEM2": ("GEFS mean", "#b22222", 1.4),
+    "EEMN": ("ECMWF ens mean",    "#0b2a8a", 1.4), "EEMI": ("ECMWF ens mean", "#0b2a8a", 1.4),
+    "UEMN": ("UKMET ens mean",    "#1b6b1b", 1.4), "UEMI": ("UKMET ens mean", "#1b6b1b", 1.4),
+    "CEMN": ("Canadian ens mean", "#c26a00", 1.4), "CEMI": ("Canadian ens mean", "#c26a00", 1.4), "CEM2": ("Canadian ens mean", "#c26a00", 1.4),
+    # --- consensus
+    "TVCN": ("Consensus TVCN",    "#555555", 2.0), "TVCA": ("Consensus TVCA", "#666666", 1.6), "TVCX": ("Consensus TVCX", "#777777", 1.4),
     "HCCA": ("HCCA",              "#777777", 1.8),
-    "IVCN": ("Intensity cons.",   "#999999", 1.6),
-    "SHIP": ("SHIPS",             "#c49c00", 1.2),
-    "DSHP": ("Decay-SHIPS",       "#e0b400", 1.2),
-    "LGEM": ("LGEM",              "#aa8800", 1.2),
+    # --- intensity-only guidance (charted, not mapped)
+    "IVCN": ("Intensity cons.",   "#999999", 1.6), "RVCN": ("RI consensus", "#aaaaaa", 1.4),
+    "SHIP": ("SHIPS",             "#c49c00", 1.2), "DSHP": ("Decay-SHIPS", "#e0b400", 1.2), "LGEM": ("LGEM", "#aa8800", 1.2),
+    "NNIC": ("NHC neural-net",    "#5c7cfa", 1.2), "NNIB": ("NHC neural-net B", "#7a94fa", 1.0),
 }
-INTENSITY_ONLY = {"SHIP", "DSHP", "LGEM", "IVCN"}
+# codes we deliberately skip on both plots: climatology/persistence baselines and NHC's own copies
+SKIP = {"CARQ", "CLP5", "OCD5", "SHF5", "TCLP", "XTRP", "DRCL", "TABD", "TABM", "TABS", "OFCI", "RI25", "RI30", "RI35", "RI40"}
+INTENSITY_ONLY = {"SHIP", "DSHP", "LGEM", "IVCN", "RVCN", "NNIC", "NNIB"}
 GEFS_PREFIX = "AP"      # AP01..AP30
 ECENS_PREFIX = "EE"     # EE01..EE50 (present when ECMWF ensemble tracks are fed)
 
@@ -133,6 +141,8 @@ def pick_tracks(adeck, max_lag_h=12):
     newest = dt.datetime.strptime(all_cycles[-1], "%Y%m%d%H")
     tracks = {}
     for tech, cyc in adeck.items():
+        if tech in SKIP:
+            continue
         best = max(cyc)
         t = dt.datetime.strptime(best, "%Y%m%d%H")
         if (newest - t).total_seconds() / 3600 <= max_lag_h and len(cyc[best]) >= 2:
@@ -192,7 +202,7 @@ def plot_track(storm, newest, tracks, btrack, cone, dest: Path):
     n_gefs = n_ecens = 0
     for tech, tr in tracks.items():
         pts = np.array([(lo, la) for _, la, lo, *_ in tr["pts"]])
-        if tech.startswith(GEFS_PREFIX) and tech[2:].isdigit():
+        if (tech.startswith(GEFS_PREFIX) and tech[2:].isdigit()) or tech == "AC00":
             ax.plot(pts[:, 0], pts[:, 1], color="#d62728", lw=0.7, alpha=0.35, transform=PC, zorder=4); n_gefs += 1
         elif tech.startswith(ECENS_PREFIX) and tech[2:].isdigit():
             ax.plot(pts[:, 0], pts[:, 1], color="#1f4ed8", lw=0.7, alpha=0.35, transform=PC, zorder=4); n_ecens += 1
@@ -238,7 +248,7 @@ def plot_intensity(storm, newest, tracks, btrack, dest: Path):
     fig, ax = plt.subplots(figsize=(12, 5.5), dpi=100)
     handles = []
     for tech, tr in tracks.items():
-        if tech.startswith(GEFS_PREFIX) and tech[2:].isdigit():
+        if (tech.startswith(GEFS_PREFIX) and tech[2:].isdigit()) or tech == "AC00":
             xs = [p[0] for p in tr["pts"] if p[3]]; ys = [p[3] for p in tr["pts"] if p[3]]
             ax.plot(xs, ys, color="#d62728", lw=0.6, alpha=0.3)
     seen = set()
@@ -490,7 +500,7 @@ def main():
             entry["ecens_members"] = sum(1 for t in tracks if t.startswith(ECENS_PREFIX) and t[2:].isdigit())
             entry["images"] = {"track": f"images/tropical/{s['id']}/track.png",
                                "intensity": f"images/tropical/{s['id']}/intensity.png"}
-            unknown = sorted(t for t in tracks if t not in MODELS and not t.startswith((GEFS_PREFIX, ECENS_PREFIX)))
+            unknown = sorted(t for t in tracks if t not in MODELS and t != "AC00" and not t.startswith((GEFS_PREFIX, ECENS_PREFIX)))
             if unknown:
                 log.info("%s: techs in a-deck not in MODELS table: %s", s["id"], " ".join(unknown))
         else:

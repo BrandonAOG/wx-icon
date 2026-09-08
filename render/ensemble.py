@@ -14,7 +14,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, minimum_filter
 
 from config import MODEL
-from plots import PC, add_basemap, colorbar, contour_labeled, mesh, new_map, title
+from plots import PC, add_basemap, colorbar, contour_labeled, mesh, mslp_levels, new_map, title, z500_levels
 
 MEMBER_COLORS = plt.get_cmap("tab20")
 
@@ -56,12 +56,12 @@ def _mean_spread(stack, meta, key, scale, unit, mean_levels, spread_bounds, labe
 
 
 def ens_mslp(stack, meta):
-    return _mean_spread(stack, meta, "prmsl", 0.01, "mb", np.arange(940, 1060, 4), [1, 2, 3, 4, 6, 8, 10, 12, 16, 20],
+    return _mean_spread(stack, meta, "prmsl", 0.01, "mb", mslp_levels(), [0.5, 1, 2, 3, 4, 6, 8, 10, 12, 16],
                         "MSLP", "MSLP ensemble mean (mb, contours) & spread")
 
 
 def ens_z500(stack, meta):
-    return _mean_spread(stack, meta, "gh500", 0.1, "dam", np.arange(480, 620, 6), [1, 2, 3, 4, 6, 8, 10, 12, 16, 20],
+    return _mean_spread(stack, meta, "gh500", 0.1, "dam", z500_levels(), [0.5, 1, 2, 3, 4, 6, 8, 10, 12, 16],
                         "500 mb", "500 mb height ensemble mean (dam) & spread", cmap="PuRd")
 
 
@@ -113,32 +113,47 @@ def ens_precip6(stack, meta):
     return fig
 
 
+SPREAD_BOUNDS = [0, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12]
+SPREAD_CMAP = mcolors.ListedColormap(["#eef7fb", "#c7e6f2", "#a2d4ea", "#7fc0e0", "#4fb0b8", "#7fd07a", "#c8e55a", "#f5e64a",
+                                      "#f5b942", "#f28b32", "#e85a2a", "#c92a2a"])
+
+
 def ens_lows(stack, meta):
-    """Every member's surface low centres, labelled with the member number and
-    coloured by central pressure. Where does each member put the storm?"""
+    """Every member's surface low centre labelled with its number and coloured by
+    central pressure, over the ensemble spread of MSLP (colour) and the mean (contours).
+    Tight cluster of red numbers on a blue background = confident, deep system;
+    scattered orange on yellow = the ensemble hasn't made up its mind."""
     fig, ax = new_map(meta)
     lon, lat = stack.lon, stack.lat
     LON, LAT = np.meshgrid(lon, lat)
-    mean = _s(np.nanmean(stack["prmsl"], axis=0) / 100)
-    ax.contour(lon, lat, mean, levels=np.arange(940, 1060, 4), colors="#555", linewidths=0.8, transform=PC, zorder=3)
-    bounds = [940, 960, 970, 980, 990, 996, 1000, 1004, 1008, 1012]
-    cmap = mcolors.ListedColormap(["#5e0a5e", "#9b0c3d", "#d0021b", "#f05a28", "#f5a623", "#7ed321", "#1f8f3a", "#2b8cbe", "#7fb3d5"])
-    norm = mcolors.BoundaryNorm(bounds, cmap.N)
-    size = max(9, len(lon) // 40)
+    blon0, blon1, blat0, blat1 = meta["bbox"]
+    p_all = stack["prmsl"] / 100
+    mean = _s(np.nanmean(p_all, axis=0)); spread = _s(np.nanstd(p_all, axis=0))
+    norm = mcolors.BoundaryNorm(SPREAD_BOUNDS, SPREAD_CMAP.N)
+    cf = mesh(ax, lon, lat, spread, None, cmap=SPREAD_CMAP, norm=norm, transform=PC, zorder=2)
+    contour_labeled(ax, lon, lat, mean, mslp_levels(), "black", 0.9)
+    pb = [940, 960, 970, 980, 990, 996, 1000, 1004, 1008, 1012]
+    pcm = mcolors.ListedColormap(["#5e0a5e", "#9b0c3d", "#d0021b", "#f05a28", "#f5a623", "#7ed321", "#1e8f3a", "#2b8cbe", "#7fb3d5"])
+    pnorm = mcolors.BoundaryNorm(pb, pcm.N)
+    size = max(11, len(lon) // 36)
     for i, m in enumerate(stack.members):
-        p = _s(stack["prmsl"][i] / 100, 1.0)
+        p = _s(p_all[i], 1.0)
         mn = minimum_filter(p, size)
-        ys, xs = np.where((p == mn) & (p < 1012))
-        label = m.replace("p", "").replace("c", "")          # c00 -> 00, p07 -> 07
+        ys, xs = np.where((p == mn) & (p < 1010))
+        label = m.replace("p", "").replace("c", "")
         for y, x in zip(ys, xs):
-            if 2 < y < len(lat) - 3 and 2 < x < len(lon) - 3:
+            if blon0 <= LON[y, x] <= blon1 and blat0 <= LAT[y, x] <= blat1:      # inside the visible frame only
                 ax.text(LON[y, x], LAT[y, x], label, fontsize=8.5, fontweight="bold", ha="center", va="center",
-                        color=cmap(norm(p[y, x])), transform=PC, zorder=7,
+                        color=pcm(pnorm(p[y, x])), transform=PC, zorder=7,
                         path_effects=[pe.withStroke(linewidth=2.2, foreground="white")])
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
     add_basemap(ax)
-    colorbar(fig, sm, "Low centre pressure (mb) · number = member, 00 = control", ticks=bounds)
-    title(fig, ax, meta, subtitle(meta, "Member surface low centres & ensemble-mean MSLP (mb)"))
+    colorbar(fig, cf, "MSLP ensemble spread (mb)", ticks=SPREAD_BOUNDS)
+    # mini legend for the number colours
+    lg = fig.add_axes([0.80, 0.036, 0.18, 0.02]); lg.axis("off")
+    for k, (v, c) in enumerate(zip([990, 1000, 1008], ["#d0021b", "#1e8f3a", "#7fb3d5"])):
+        lg.text(k / 3, 0.5, f"■ <{v} mb", color=c, fontsize=8, fontweight="bold", va="center", transform=lg.transAxes)
+    fig.text(0.99, 0.015, "numbers = member low centres, coloured by pressure (00 = control)", ha="right", fontsize=8, color="#666")
+    title(fig, ax, meta, subtitle(meta, "Member low centres, MSLP spread (colour) & ensemble mean (mb)"))
     return fig
 
 
@@ -182,7 +197,7 @@ def _prob(stack, meta, mask_stack, title_txt, extra=None):
     if extra:
         extra(ax)
     mean = _s(np.nanmean(stack["prmsl"], axis=0) / 100)
-    ax.contour(lon, lat, mean, levels=np.arange(940, 1060, 4), colors="#555", linewidths=0.6, transform=PC, zorder=4)
+    ax.contour(lon, lat, mean, levels=mslp_levels(), colors="#555", linewidths=0.6, transform=PC, zorder=4)
     add_basemap(ax)
     colorbar(fig, cf, "Probability (% of members)", ticks=PROB_BOUNDS)
     title(fig, ax, meta, subtitle(meta, title_txt + " & mean MSLP (mb)"))

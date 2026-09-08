@@ -22,7 +22,7 @@ import matplotlib.ticker
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
-from config import DPI, FIG_SIZE, MODEL, SITE_NAME
+from config import DPI, FIG_SIZE, LABEL_CITIES, LABEL_REGIONS, MODEL, SITE_NAME
 
 log = logging.getLogger("plots")
 PC = ccrs.PlateCarree()
@@ -46,7 +46,24 @@ def projection_for(bbox):
                                  standard_parallels=(lat0 + 5, lat1 - 5))
 
 
+CURRENT = {"small": False}     # set by new_map: is this a small region (tighter contour intervals)?
+
+
+def small_region(meta) -> bool:
+    lon0, lon1, lat0, lat1 = meta["bbox"]
+    return (lon1 - lon0) <= 16 or (lat1 - lat0) <= 10
+
+
+def mslp_levels():
+    return np.arange(940, 1060, 2) if CURRENT["small"] else np.arange(940, 1060, 4)
+
+
+def z500_levels():
+    return np.arange(480, 620, 3) if CURRENT["small"] else np.arange(480, 620, 6)
+
+
 def new_map(meta):
+    CURRENT["small"] = small_region(meta)
     fig = plt.figure(figsize=FIG_SIZE, dpi=DPI)
     proj = projection_for(meta["bbox"])
     ax = fig.add_axes([0.01, 0.08, 0.98, 0.825], projection=proj)
@@ -182,7 +199,7 @@ def plot_z500_vort(f, meta):
     vort = pick(f, "absv500", "absv") * 1e5     # 1e-5 s^-1
     levels = np.arange(8, 60, 2)
     cf = ax.contourf(lon, lat, vort, levels=levels, cmap=VORT_CMAP, extend="max", transform=PC, zorder=2)
-    contour_labeled(ax, lon, lat, z, np.arange(480, 620, 6), "black", 1.0)
+    contour_labeled(ax, lon, lat, z, z500_levels(), "black", 1.0)
     if "u500" in f:
         barbs(ax, lon, lat, pick(f, "u500") * 1.944, pick(f, "v500") * 1.944, color="#333")
     add_basemap(ax)
@@ -218,7 +235,7 @@ def plot_mslp_precip(f, meta):
                    linestyles="dashed", transform=PC, zorder=5)
         ax.contour(lon, lat, thk, levels=np.arange(546, 600, 6), colors="#d62828", linewidths=0.8,
                    linestyles="dashed", transform=PC, zorder=5)
-    contour_labeled(ax, lon, lat, mslp, np.arange(940, 1060, 4), "black", 1.0)
+    contour_labeled(ax, lon, lat, mslp, mslp_levels(), "black", 1.0)
     hilo(ax, lon, lat, mslp)
     add_basemap(ax)
     title(fig, ax, meta, "MSLP (mb), 1000–500 mb thickness (dam) & 6-hr precipitation (in)")
@@ -233,7 +250,7 @@ def plot_t850_wind(f, meta):
     cf = ax.contourf(lon, lat, t, levels=levels, cmap="RdYlBu_r", extend="both", transform=PC, zorder=2)
     ax.contour(lon, lat, t, levels=[0], colors="k", linewidths=1.2, linestyles="dashed", transform=PC, zorder=4)
     if "prmsl" in f:
-        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), np.arange(940, 1060, 4), "black", 0.8)
+        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), mslp_levels(), "black", 0.8)
     barbs(ax, lon, lat, pick(f, "u850") * 1.944, pick(f, "v850") * 1.944, color="#222")
     add_basemap(ax)
     colorbar(fig, cf, "850 mb temperature (°C)", ticks=levels[::3])
@@ -248,10 +265,16 @@ def plot_t2m(f, meta):
     levels = np.arange(-30, 121, 5)
     cf = ax.contourf(lon, lat, tf, levels=levels, cmap="turbo", extend="both", transform=PC, zorder=2)
     ax.contour(lon, lat, tf, levels=[32], colors="k", linewidths=1.0, linestyles="dashed", transform=PC, zorder=4)
+    step = 5 if meta.get("region") in LABEL_REGIONS else 10
+    cs = ax.contour(lon, lat, smooth(tf, 1.0), levels=np.arange(-30, 125, step), colors="#222", linewidths=0.5, alpha=0.7, transform=PC, zorder=4)
+    ax.clabel(cs, fmt="%d", fontsize=7, inline=True, inline_spacing=2)
     if "prmsl" in f:
-        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), np.arange(940, 1060, 4), "#333", 0.6)
+        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), mslp_levels(), "#555", 0.5, linestyles="dashed")
+    f_tf = dict(f); f_tf["tf"] = tf
+    ff = type("F", (dict,), {})(f_tf); ff.lon, ff.lat = lon, lat
+    city_values(ax, ff, "tf", meta, fmt="{:.0f}°")
     add_basemap(ax)
-    colorbar(fig, cf, "2 m temperature (°F)", ticks=levels[::2])
+    colorbar(fig, cf, "2 m temperature (°F) — contours every %d °F" % step, ticks=levels[::2])
     title(fig, ax, meta, "2 m temperature (°F) & MSLP (mb)")
     return fig
 
@@ -271,8 +294,11 @@ def plot_wind10m(f, meta):
     barbs(ax, lon, lat, u, v, color="#222")
     if "prmsl" in f:
         mslp = smooth(pick(f, "prmsl") / 100)
-        contour_labeled(ax, lon, lat, mslp, np.arange(940, 1060, 4), "black", 0.9)
+        contour_labeled(ax, lon, lat, mslp, mslp_levels(), "black", 0.9)
         hilo(ax, lon, lat, mslp)
+    fs = dict(f); fs["spd"] = spd
+    ff = type("F", (dict,), {})(fs); ff.lon, ff.lat = lon, lat
+    city_values(ax, ff, "spd", meta, fmt="{:.0f} kt")
     add_basemap(ax)
     colorbar(fig, cf, "10 m wind speed (kt)", ticks=bounds)
     title(fig, ax, meta, "MSLP (mb) & 10 m wind (kt)")
@@ -287,7 +313,7 @@ def plot_pwat(f, meta):
     cmap = plt.get_cmap("gist_earth_r")
     cf = ax.contourf(lon, lat, pw, levels=levels, cmap=cmap, extend="both", transform=PC, zorder=2)
     if "prmsl" in f:
-        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), np.arange(940, 1060, 4), "white", 0.7)
+        contour_labeled(ax, lon, lat, smooth(pick(f, "prmsl") / 100), mslp_levels(), "white", 0.7)
     add_basemap(ax)
     colorbar(fig, cf, "Precipitable water (mm)", ticks=levels[::4])
     title(fig, ax, meta, "MSLP (mb) & precipitable water (mm)")
@@ -312,6 +338,28 @@ def plot_cape(f, meta):
     colorbar(fig, cf, "Surface-based CAPE (J/kg)", ticks=bounds)
     title(fig, ax, meta, "Surface-based CAPE (J/kg), 850 mb (red) & 500 mb (blue) wind (kt)")
     return fig
+
+
+def city_values(ax, f, key, meta, fmt="{:.0f}", scale=1.0, offset=0.0, color="#111"):
+    """Print a field's value at each labelled city (Florida/Gulf/Southeast views only)."""
+    if meta.get("region") not in LABEL_REGIONS or key not in f:
+        return
+    lon0, lon1, lat0, lat1 = meta["bbox"]
+    small = (lon1 - lon0) <= 16
+    for name, la, lo in LABEL_CITIES:
+        if not (lon0 + 0.4 <= lo <= lon1 - 0.4 and lat0 + 0.3 <= la <= lat1 - 0.3):
+            continue
+        j = int(np.argmin(np.abs(f.lat - la))); i = int(np.argmin(np.abs(f.lon - lo)))
+        v = f[key][j, i]
+        if not np.isfinite(v):
+            continue
+        txt = fmt.format(v * scale + offset)
+        ax.plot(lo, la, "o", ms=3, color=color, mec="white", mew=0.6, transform=PC, zorder=9)
+        ax.text(lo, la + (0.12 if small else 0.25), txt, fontsize=9 if small else 8, fontweight="bold", ha="center", va="bottom",
+                color=color, transform=PC, zorder=9, path_effects=[matplotlib.patheffects.withStroke(linewidth=2.5, foreground="white")])
+        if small:
+            ax.text(lo, la - 0.12, name, fontsize=6.5, ha="center", va="top", color="#333", transform=PC, zorder=9,
+                    path_effects=[matplotlib.patheffects.withStroke(linewidth=2, foreground="white")])
 
 
 # ---------------------------------------------------- colour tables ---------
@@ -399,8 +447,8 @@ def mslp_contours(ax, f, color="black", lw=0.9, labels=True):
         return None
     m = smooth(f["prmsl"] / 100)
     if labels:
-        return contour_labeled(ax, f.lon, f.lat, m, np.arange(940, 1060, 4), color, lw)
-    return ax.contour(f.lon, f.lat, m, levels=np.arange(940, 1060, 4), colors=color, linewidths=lw, transform=PC, zorder=6)
+        return contour_labeled(ax, f.lon, f.lat, m, mslp_levels(), color, lw)
+    return ax.contour(f.lon, f.lat, m, levels=mslp_levels(), colors=color, linewidths=lw, transform=PC, zorder=6)
 
 
 def ptype_masks(f):
@@ -541,7 +589,7 @@ def plot_rh700_300(f, meta):
     levels = np.arange(0, 101, 10)
     cf = ax.contourf(lon, lat, rh, levels=levels, cmap="BrBG", transform=PC, zorder=2)
     if "gh500" in f:
-        contour_labeled(ax, lon, lat, smooth(f["gh500"] / 10), np.arange(480, 620, 6), "black", 0.8)
+        contour_labeled(ax, lon, lat, smooth(f["gh500"] / 10), z500_levels(), "black", 0.8)
     add_basemap(ax)
     colorbar(fig, cf, "700–300 mb mean relative humidity (%)", ticks=levels)
     title(fig, ax, meta, "700–300 mb mean relative humidity (%) & 500 mb height (dam)")
@@ -556,7 +604,7 @@ def plot_z500_mslp(f, meta):
     z = smooth(pick(f, "gh500") / 10)
     levels = np.arange(492, 600, 3)
     cf = ax.contourf(lon, lat, z, levels=levels, cmap="turbo", extend="both", transform=PC, zorder=2)
-    ax.contour(lon, lat, z, levels=np.arange(480, 620, 6), colors="black", linewidths=0.7, transform=PC, zorder=4)
+    ax.contour(lon, lat, z, levels=z500_levels(), colors="black", linewidths=0.7, transform=PC, zorder=4)
     mslp_contours(ax, f, color="white", lw=1.0)
     add_basemap(ax)
     colorbar(fig, cf, "500 mb height (dam)", ticks=levels[::4])
@@ -739,7 +787,7 @@ def plot_shear(f, meta):
     ax.quiver(lon[::every], lat[::every], du[::every, ::every], dv[::every, ::every], transform=PC, zorder=7,
               scale=900, width=0.0016, color="#222", pivot="middle")
     if "gh500" in f:
-        contour_labeled(ax, lon, lat, smooth(f["gh500"] / 10), np.arange(480, 620, 6), "black", 0.7)
+        contour_labeled(ax, lon, lat, smooth(f["gh500"] / 10), z500_levels(), "black", 0.7)
     add_basemap(ax)
     colorbar(fig, cf, "850–200 mb shear (kt) — under 20 kt favours tropical development", ticks=bounds)
     title(fig, ax, meta, "850–200 mb wind shear (kt, arrows show shear vector) & 500 mb height (dam)")
@@ -834,4 +882,42 @@ def plot_vort_layer(f, meta):
     add_basemap(ax)
     colorbar(fig, cf, "850–500 mb mean relative vorticity (10⁻⁵ s⁻¹)", ticks=levels[::2])
     title(fig, ax, meta, "850–500 mb layer-mean vorticity, 700 mb wind (kt) & MSLP (mb)")
+    return fig
+
+
+# ---------------------------------------------------- mesoscale extras ------
+
+def plot_precip6(f, meta):
+    """6-hr precipitation on its own (models without MSLP, e.g. the National Blend)."""
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    if "tp_6" in f:
+        cmap, norm, bounds = _precip_cmap()
+        cf = mesh(ax, lon, lat, f["tp_6"] / 25.4, 0.01, cmap=cmap, norm=norm, transform=PC, zorder=2)
+        colorbar(fig, cf, "6-hr precipitation (in)", ticks=bounds)
+    else:
+        ax.text(0.5, 0.5, "Not available at this hour", transform=ax.transAxes, ha="center", fontsize=11, color="#666", zorder=9)
+    mslp_contours(ax, f, lw=0.7)
+    add_basemap(ax)
+    title(fig, ax, meta, "6-hr precipitation (in)")
+    return fig
+
+
+def plot_gust(f, meta):
+    fig, ax = new_map(meta)
+    lon, lat = f.lon, f.lat
+    g = pick(f, "gust") * 1.944
+    bounds = [15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 100]
+    colors = ["#cfe8ff", "#9dcbff", "#5aa7f5", "#2e7ad8", "#2bb673", "#7ed321", "#f8e71c", "#f5a623", "#f05a28", "#d0021b", "#9b0c3d"]
+    cmap = mcolors.ListedColormap(colors); norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    cf = mesh(ax, lon, lat, g, 15, cmap=cmap, norm=norm, transform=PC, zorder=2)
+    if "u10" in f:
+        barbs(ax, lon, lat, pick(f, "u10") * 1.944, pick(f, "v10") * 1.944, color="#333")
+    mslp_contours(ax, f, lw=0.7)
+    fg = dict(f); fg["gkt"] = g
+    ff = type("F", (dict,), {})(fg); ff.lon, ff.lat = lon, lat
+    city_values(ax, ff, "gkt", meta, fmt="{:.0f} kt")
+    add_basemap(ax)
+    colorbar(fig, cf, "10 m wind gust (kt)", ticks=bounds)
+    title(fig, ax, meta, "10 m wind gust (kt)")
     return fig

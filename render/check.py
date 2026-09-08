@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import requests  # noqa: E402
 
-from config import FORECAST_HOURS, MODEL  # noqa: E402
+from config import FORECAST_HOURS, MANIFEST_NAME, MODEL  # noqa: E402
 from fetch import latest_available_run, run_max_hour  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -68,23 +68,26 @@ def main():
     cap = run_max_hour(run, session) or hours[-1]
     hours = [h for h in hours if h <= cap]          # 06/18Z ECMWF runs are shorter
 
-    published = None
+    published, published_max = None, None
     site = os.environ.get("SITE_URL")
     if site:
         try:
-            r = session.get(site.rstrip("/") + "/manifest.json", timeout=30, headers={"Cache-Control": "no-cache"})
+            r = session.get(site.rstrip("/") + "/" + MANIFEST_NAME, timeout=30, headers={"Cache-Control": "no-cache"})
             if r.ok:
                 runs = r.json().get("model", {}).get("runs", [])
                 published = runs[0]["id"] if runs else None
+                published_max = max(runs[0]["hours"]) if runs and runs[0].get("hours") else None
             else:
                 log.info("live manifest: HTTP %s (first deploy?)", r.status_code)
         except Exception as e:  # noqa: BLE001
             log.warning("could not read live manifest: %s", e)
 
-    needs = args.force or args.run is not None or published != run_id
+    extended = published == run_id and published_max is not None and hours and hours[-1] > published_max
+    needs = args.force or args.run is not None or published != run_id or extended
     n = max(1, min(args.chunks, len(hours)))
     slices = [",".join(str(h) for h in hours[i::n]) for i in range(n)]  # interleaved so slices finish together
-    log.info("%s: latest run %s, live %s -> render=%s (%d slices)", MODEL["name"], run_id, published, needs, n)
+    log.info("%s: latest run %s to %dh, live %s to %sh -> render=%s%s (%d slices)", MODEL["name"], run_id, cap,
+             published, published_max, needs, " (extending live run)" if extended else "", n)
     gh_output(run=run_id, needs_render="true" if needs else "false", chunks=slices)
 
 
