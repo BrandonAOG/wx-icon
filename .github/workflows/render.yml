@@ -139,6 +139,9 @@ jobs:
 
   deploy:
     needs: assemble
+    # GitHub's default success() looks up the whole chain, so a failed render slice
+    # would skip this even when assemble passed. Deploy whenever assemble did.
+    if: always() && needs.assemble.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
