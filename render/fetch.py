@@ -291,29 +291,47 @@ def available_pairs(run: dt.datetime, fhr: int, pairs, session) -> set:
     if not url:
         return set(pairs)
     if url not in _IDX_CACHE:
-        try:
-            r = session.get(url, timeout=60)
-            if r.status_code != 200:
-                log.info("idx %s -> HTTP %s; requesting all fields", url.rsplit("/", 1)[-1], r.status_code)
-                return set(pairs)
-            present = set()
-            for line in r.text.splitlines():
-                parts = line.split(":")
-                if len(parts) > 4:
-                    present.add((parts[3], parts[4]))
-            _IDX_CACHE[url] = present
-        except requests.RequestException as e:
-            log.info("idx fetch failed (%s); requesting all fields", str(e)[:60]); return set(pairs)
+        present = None
+        for attempt in range(3):
+            try:
+                r = session.get(url, timeout=60)
+                if r.status_code == 200:
+                    present = set()
+                    for line in r.text.splitlines():
+                        parts = line.split(":")
+                        if len(parts) > 4:
+                            present.add((parts[3], parts[4]))
+                    break
+                if r.status_code == 404:
+                    break
+                log.info("idx %s -> HTTP %s", url.rsplit("/", 1)[-1], r.status_code)
+            except requests.RequestException as e:
+                log.info("idx fetch failed (%s)", str(e)[:60])
+            time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+        if present is None:
+            if MODEL["source"] == "nomads_grid":
+                # these models' filters reject unknown levels with a 500; without the
+                # index we can't build a safe request, so skip this hour
+                raise RuntimeError(f"f{fhr:03d}: index unavailable ({url.rsplit('/', 1)[-1]}); skipping hour")
+            log.info("idx unavailable; requesting all fields"); return set(pairs)
+        _IDX_CACHE[url] = present
     present = _IDX_CACHE[url]
     norm = lambda t: t.replace(" (considered as a single layer)", "").strip()
-    present_n = {(v, norm(l)) for v, l in present}
+    present_n = {}
+    for v, l in present:
+        present_n.setdefault((v, norm(l)), l)          # normalised -> the model's actual level text
     keep, dropped = set(), []
     for var, lev in pairs:
-        lev_txt = norm(_IDX_LEVEL.get(lev, lev.replace("_", " ")))
-        if (var, lev_txt) in present_n:
+        default_txt = _IDX_LEVEL.get(lev, lev.replace("_", " "))
+        actual = present_n.get((var, norm(default_txt)))
+        if actual is None:
+            dropped.append(f"{var}@{lev}"); continue
+        if actual == default_txt:
             keep.add((var, lev))
         else:
-            dropped.append(f"{var}@{lev}")
+            # the model spells this level differently (e.g. NAM's REFC at "entire atmosphere
+            # (considered as a single layer)"): request it the way its own filter names it
+            keep.add((var, actual.replace(" ", "_").replace("(", "\\(").replace(")", "\\)")))
     if dropped and (fhr, tuple(sorted(dropped))) not in _SKIP_LOGGED:
         _SKIP_LOGGED.add((fhr, tuple(sorted(dropped))))
         if len(_SKIP_LOGGED) <= 6:
@@ -730,15 +748,30 @@ def aigefs_url(run: dt.datetime, fhr: int, member: str, ftype: str = "pres") -> 
     return MODEL["path"].format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), mem=n, fhr=fhr).replace(".pres.", f".{ftype}.")
 
 
+AIGEFS_TYPE_CANDIDATES = ["pres", "sfc", "surface", "flux", "2d", "sflux", "pgrb2", "atm"]
+
+
 def aigefs_file_types(run: dt.datetime, session) -> list:
-    """Distinct file types in a member's grib2 folder, e.g. ['pres', 'sfc']."""
+    """File types available for this run (e.g. ['pres', 'sfc']). Tries the folder
+    listing, then probes candidate names by HEAD on their .idx, since NOMADS often
+    won't answer directory listings under load."""
     global _AIGEFS_TYPES
     if _AIGEFS_TYPES is not None:
         return _AIGEFS_TYPES
     folder = aigefs_url(run, 0, "c00").rsplit("/", 1)[0] + "/"
-    names = [f for f in _listing(session, folder, retries=2, timeout=30) if f.endswith(".grib2")]
+    names = [f for f in _listing(session, folder, retries=1, timeout=20) if f.endswith(".grib2")]
     types = sorted({f.split(".")[2] for f in names if f.count(".") >= 4})
-    log.info("AI-GEFS file types in %s: %s (%d files)", folder, types or "listing unavailable", len(names))
+    if not types:
+        for t in AIGEFS_TYPE_CANDIDATES:
+            try:
+                r = session.head(aigefs_url(run, 6, "c00", t) + ".idx", timeout=20)
+                if r.status_code == 200:
+                    types.append(t)
+            except requests.RequestException:
+                pass
+        log.info("AI-GEFS file types (probed): %s", types)
+    else:
+        log.info("AI-GEFS file types (listed): %s", types)
     _AIGEFS_TYPES = types or ["pres"]
     return _AIGEFS_TYPES
 

@@ -315,10 +315,18 @@ def main():
                 except RuntimeError as e:
                     log.warning("f%03d member %s: %s", fhr, m, e); return m, None
             from concurrent.futures import ThreadPoolExecutor as _TPE
-            with _TPE(max_workers=4) as pool:
+            with _TPE(max_workers=2 if MODEL["source"] == "aigefs" else 4) as pool:
                 for m, path in pool.map(one, MODEL["members"]):
                     if path:
                         files[m] = path
+            missing_m = [m for m in MODEL["members"] if m not in files]
+            if missing_m and len(missing_m) < len(MODEL["members"]):
+                time.sleep(20)                              # let the server breathe, then retry the stragglers once
+                for m, path in map(one, missing_m):
+                    if path:
+                        files[m] = path
+            if len(files) < 3:
+                log.error("f%03d: only %d members downloaded; skipping hour", fhr, len(files)); continue
             for region in args.regions:
                 grib_paths[(fhr, region)] = files
             continue

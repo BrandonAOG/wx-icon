@@ -68,7 +68,7 @@ def main():
     cap = run_max_hour(run, session) or hours[-1]
     hours = [h for h in hours if h <= cap]          # 06/18Z ECMWF runs are shorter
 
-    published, published_max = None, None
+    published, published_max, published_hours = None, None, set()
     site = os.environ.get("SITE_URL")
     if site:
         try:
@@ -77,13 +77,18 @@ def main():
                 runs = r.json().get("model", {}).get("runs", [])
                 published = runs[0]["id"] if runs else None
                 published_max = max(runs[0]["hours"]) if runs and runs[0].get("hours") else None
+                published_hours = set(runs[0].get("hours", [])) if runs else set()
             else:
                 log.info("live manifest: HTTP %s (first deploy?)", r.status_code)
         except Exception as e:  # noqa: BLE001
             log.warning("could not read live manifest: %s", e)
 
     extended = published == run_id and published_max is not None and hours and hours[-1] > published_max
-    needs = args.force or args.run is not None or published != run_id or extended
+    holes = published == run_id and bool(published_hours) and any(h not in published_hours for h in hours)
+    needs = args.force or args.run is not None or published != run_id or extended or holes
+    if holes and not extended:
+        missing = [h for h in hours if h not in published_hours]
+        log.info("live run is missing %d hour(s) %s; re-rendering to fill them", len(missing), missing[:12])
     n = max(1, min(args.chunks, len(hours)))
     slices = [",".join(str(h) for h in hours[i::n]) for i in range(n)]  # interleaved so slices finish together
     log.info("%s: latest run %s to %dh, live %s to %sh -> render=%s%s (%d slices)", MODEL["name"], run_id, cap,

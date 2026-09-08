@@ -396,13 +396,84 @@ def read_outlook_areas(session):
                     continue
                 p2 = rec.get("PROB2DAY") or rec.get("prob2day") or ""
                 p7 = rec.get("PROB7DAY") or rec.get("prob7day") or ""
+                raw = str(rec.get("BASIN", rec.get("basin", ""))).strip().lower()
+                basin = "al" if raw.startswith(("al", "atl")) else "ep" if raw.startswith(("ep", "pac", "east")) else "cp" if raw.startswith(("cp", "cent")) else None
+                if basin is None:                     # fall back to geography
+                    basin = "al" if pts[:, 0].mean() > -100 else "ep"
                 out.append({"lons": pts[:, 0], "lats": pts[:, 1], "prob2": str(p2).strip(), "prob7": str(p7).strip(),
-                            "basin": str(rec.get("BASIN", rec.get("basin", ""))).strip().lower() or ("al" if pts[:, 0].mean() > -100 else "ep"),
-                            "area": str(rec.get("AREA", rec.get("area", ""))).strip()})
+                            "basin": basin, "area": str(rec.get("AREA", rec.get("area", ""))).strip()})
         return out
     except Exception as e:  # noqa: BLE001
         log.warning("outlook areas unavailable: %s", e)
         return []
+
+
+BOM_WAVES = "https://www.bom.gov.au/clim_data/IDCK000080/{wave}.tropical_waves.daily.glb_tropics.{ymd}.hr.png"
+BOM_WAVE_TYPES = [("mjo", "Madden-Julian Oscillation"), ("kelvin", "Kelvin wave"), ("eq_rossby", "Equatorial Rossby wave"), ("gravity", "Mixed Rossby-gravity wave")]
+
+
+def fetch_bom_waves(session, out_dir: Path, back_days: int = 30, ahead_days: int = 45) -> list:
+    """BoM 'tropical atmospheric waves' daily frames — one image per wave type
+    (MJO, Kelvin, equatorial Rossby, MRG) per day, observed and forecast days.
+    Returns [{date, images: {type: path}}]. Cached on disk between runs. CC BY (BoM)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # BoM refuses non-browser clients; present browser-like headers for these requests only
+    bom = requests.Session()
+    bom.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+                        "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8", "Referer": "https://www.bom.gov.au/climate/mjo/",
+                        "Accept-Language": "en-US,en;q=0.9"})
+    today = dt.datetime.now(dt.timezone.utc).date()
+    frames, misses, seen_types, statuses = [], 0, set(), {}
+    for k in range(-back_days, ahead_days + 1):
+        d = today + dt.timedelta(days=k); ymd = d.strftime("%Y%m%d")
+        images = {}
+        for wave, _ in BOM_WAVE_TYPES:
+            dest = out_dir / f"{wave}_{ymd}.png"
+            if not dest.exists():
+                try:
+                    r = bom.get(BOM_WAVES.format(wave=wave, ymd=ymd), timeout=30)
+                    statuses[r.status_code] = statuses.get(r.status_code, 0) + 1
+                    if r.status_code == 200 and len(r.content) > 5000:
+                        dest.write_bytes(r.content)
+                    else:
+                        continue
+                except requests.RequestException as e:
+                    statuses["error"] = statuses.get("error", 0) + 1; continue
+            images[wave] = f"images/mjo/{dest.name}"; seen_types.add(wave)
+        if not images:
+            misses += 1
+            if k > 0 and misses > 6:                  # past the end of the forecast frames
+                break
+            continue
+        misses = 0
+        frames.append({"date": d.isoformat(), "images": images})
+    # BoM's RMM charts can't be hot-linked (they block other sites), so copy them too:
+    # the phase-space diagram (last 40 days) and the daily RMM index series (dated; take the newest that exists)
+    try:
+        r = bom.get("https://www.bom.gov.au/clim_data/IDCKGEM000/rmm.phase.Last40days.gif", timeout=30)
+        if r.status_code == 200 and len(r.content) > 5000:
+            (out_dir / "rmm_phase.gif").write_bytes(r.content)
+        else:
+            log.info("BoM RMM phase diagram -> HTTP %s", r.status_code)
+        for k in range(0, 6):
+            d = today - dt.timedelta(days=k)
+            r = bom.get(f"https://www.bom.gov.au/clim_data/IDCK000080/mjo_rmm.daily.{d:%Y%m%d}.png", timeout=30)
+            if r.status_code == 200 and len(r.content) > 5000:
+                (out_dir / "rmm_daily.png").write_bytes(r.content); break
+        # BoM Hovmöllers (OLR and 850 hPa wind anomalies, 15°S–15°N) replace CPC's, whose page image is years stale
+        for name, url in [("hov_olr.png", "https://www.bom.gov.au/clim_data/IDCKGEM000/olr_hovs_183_-15_15.ps.png"),
+                          ("hov_u850.png", "https://www.bom.gov.au/clim_data/IDCKGEM000/winds_hovs_u850_183_-15_15.ps.png")]:
+            r = bom.get(url, timeout=30)
+            if r.status_code == 200 and len(r.content) > 5000:
+                (out_dir / name).write_bytes(r.content)
+            else:
+                log.info("BoM %s -> HTTP %s", name, r.status_code)
+    except requests.RequestException as e:
+        log.info("BoM RMM charts failed: %s", e)
+    missing_types = [w for w, _ in BOM_WAVE_TYPES if w not in seen_types]
+    log.info("BoM tropical waves: %d frames; types found %s%s; HTTP responses %s", len(frames), sorted(seen_types),
+             f"; NOT found (name guess wrong?): {missing_types}" if missing_types else "", statuses)
+    return frames
 
 
 def synthetic_storm():
@@ -512,6 +583,11 @@ def main():
         dest = OUT / f"overview_{basin}.png"
         plot_overview(basin, [s for s in storms if s["basin"] == basin], dest, areas)
         result["overviews"][basin] = f"images/tropical/overview_{basin}.png"
+    if not args.synthetic:
+        try:
+            result["mjo_frames"] = fetch_bom_waves(session, SITE / "images" / "mjo")
+        except Exception as e:  # noqa: BLE001
+            log.warning("BoM waves unavailable: %s", e)
     result["areas"] = [{"basin": a["basin"], "prob2": a["prob2"], "prob7": a["prob7"],
                         "lat": round(float(np.mean(a["lats"])), 1), "lon": round(float(np.mean(a["lons"])), 1)} for a in areas]
 

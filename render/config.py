@@ -79,7 +79,7 @@ MODELS["ecens"] = {
 MODELS["aifsens"] = dict(MODELS["ecens"], id="aifsens", name="ECMWF AIFS ENS", source="ecmwf_aifs_ens",
                          min_age_hours=7.0, cycles=[0, 6, 12, 18], probe_max_hours=[240, 144],
                          hours=list(range(0, 241, 6)), credit="ECMWF open data AIFS-ENS (CC-BY-4.0)")
-MODELS["aigefs"] = dict(MODELS["gefs"], id="aigefs", name="AI-GEFS", source="aigefs", credit="NOAA/NCEP AIGEFS via NOMADS",
+MODELS["aigefs"] = dict(MODELS["gefs"], id="aigefs", name="AI-GEFS", resolution="0.25°", source="aigefs", credit="NOAA/NCEP AIGEFS via NOMADS",
                         min_age_hours=4.0, hours=list(range(0, 241, 6)), probe_max_hours=[240, 120],
                         # NOMADS layout (no grib_filter): fields are byte-ranged out of each member's file via its .idx
                         path="https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/v1.0/aigefs.{ymd}/{hh}/mem{mem:03d}/model/atmos/grib2/aigefs.t{hh}z.pres.f{fhr:03d}.grib2",
